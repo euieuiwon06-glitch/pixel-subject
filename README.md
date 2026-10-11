@@ -10,7 +10,10 @@ npm install
 npm run dev        # http://localhost:8765 (run.bat 더블클릭으로도 실행)
 npm run build      # dist/ 에 프로덕션 빌드
 npm run preview    # 빌드 결과를 http://localhost:8765 에서 확인
+npm run deploy     # 빌드 후 gh-pages 브랜치로 배포
 ```
+
+공개 페이지: https://euieuiwon06-glitch.github.io/pixel-subject/
 
 - 카메라는 `localhost` 또는 HTTPS에서만 열린다.
 - `npm run dev`/`build` 전에 `scripts/prepare-assets.mjs`가 MediaPipe wasm을 `public/mediapipe/wasm`으로 복사하고,
