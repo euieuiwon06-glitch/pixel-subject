@@ -1,0 +1,81 @@
+html, body {
+  margin: 0;
+  height: 100%;
+  background: #000;
+  overflow: hidden;
+  color: #8c8c8c;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, 'D2Coding', monospace;
+}
+
+canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+  display: block;
+}
+
+/* 원본 영상은 디코딩만 하고 보이지 않게 둔다 */
+video {
+  position: fixed;
+  left: 0;
+  top: 0;
+  width: 2px;
+  height: 2px;
+  opacity: 0;
+  pointer-events: none;
+}
+
+.status {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  max-width: min(420px, calc(100vw - 32px));
+  font-size: 11px;
+  line-height: 1.7;
+  letter-spacing: 0.04em;
+  text-align: center;
+  white-space: pre-line;
+}
+
+.status[hidden] { display: none; }
+
+.status button {
+  margin-top: 14px;
+  padding: 6px 12px;
+  background: #000;
+  color: #c8c8c8;
+  border: 1px solid #555;
+  font: inherit;
+  letter-spacing: 0.12em;
+  cursor: pointer;
+}
+
+.status button:hover { border-color: #aaa; color: #fff; }
+.status button:focus-visible { outline: 1px solid #fff; outline-offset: 2px; }
+
+.debug {
+  position: fixed;
+  top: 12px;
+  right: 12px;
+  width: 260px;
+  padding: 10px;
+  background: #000;
+  border: 1px solid #333;
+  font-size: 10px;
+  color: #9a9a9a;
+  z-index: 2;
+}
+
+.debug label {
+  display: grid;
+  grid-template-columns: 1fr 96px 40px;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 4px;
+}
+
+.debug input[type='range'] { width: 100%; accent-color: #bbb; }
+.debug output { text-align: right; color: #ddd; }
+.debug pre { margin: 8px 0 0; color: #777; font: inherit; line-height: 1.5; }

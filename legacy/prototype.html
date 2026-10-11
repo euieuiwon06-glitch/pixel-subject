@@ -1,0 +1,555 @@
+<!doctype html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Pixel Subject</title>
+<style>
+  html,body{margin:0;height:100%;background:#000;overflow:hidden;color:#888;
+    font-family:ui-monospace,"SF Mono",Menlo,Consolas,monospace}
+  canvas{display:block;width:100vw;height:100vh}
+  video{display:none}
+  #start{position:fixed;inset:0;display:grid;place-items:center;background:#000;cursor:pointer;
+    font-size:11px;letter-spacing:.32em;text-transform:uppercase;color:#9a9a9a}
+  #start.hide{display:none}
+  #hud{position:fixed;left:16px;bottom:16px;font-size:11px;line-height:1.8;color:#6c6c6c;
+    white-space:pre;opacity:0;transition:opacity .25s;pointer-events:none}
+  #hud.on{opacity:1}
+  #hud b{color:#cfcfcf;font-weight:600}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<video id="v" playsinline muted></video>
+<div id="start">click to start camera</div>
+<div id="hud"></div>
+
+<script type="module">
+import { FilesetResolver, ImageSegmenter } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const $ = s => document.querySelector(s);
+const cv = $('#c'), ctx = cv.getContext('2d', { alpha: false });
+const video = $('#v'), startEl = $('#start'), hud = $('#hud');
+
+// 그리드 해상도 샘플링용 캔버스
+const sc = document.createElement('canvas'), sx = sc.getContext('2d', { willReadFrequently: true });
+const mc = document.createElement('canvas'), mx = mc.getContext('2d');
+const mg = document.createElement('canvas'), gx = mg.getContext('2d', { willReadFrequently: true });
+
+const cfg = { cell: 7, moveCell: 16, mode: 'ai', scatter: 1, invert: null, hud: false };
+// 회색 단계표 (어두움 → 밝음). 값을 고치거나 개수를 바꾸면 그대로 반영됨
+const PALETTE = [40, 50, 88, 112, 136, 160, 195, 225, 255];
+const TONES = PALETTE.length;
+const toneGray = v => PALETTE[Math.round(v * (TONES - 1))];
+const IDLE_JITTER = 0.5;           // 가만히 있을 때 외곽이 꿈틀대는 정도 (0 = 끔)
+const MAX_REACH = 2;               // 픽셀이 목표 자리에서 벗어날 수 있는 최대 거리 (moveCell 배수)
+const MOVE_GROW = 0.9;             // 움직인 셀 최대 크기 = moveCell × (1 + 0.9)
+// 흩어짐·잔상 (8765 Vite 버전과 같은 방식·값)
+const SPRING = 0.075;              // 목표 자리로 끌어당기는 힘 — 작을수록 늦게 따라옴
+const FRICTION = 0.83;             // 속도 보존율
+const TRAIL_MS = 600;              // 떨어져 나간 픽셀·잔상의 평균 수명 (개별 0.5–1.5배)
+const MOTION_TH = 520;             // 이 속도(px/s)에서 움직임 세기 1
+
+let dpr, W, H, cs, ms, cols, rows, N, ox, oy;
+let tone, lum, prev, raw, msk, rim, tmp, glife, cur, bgRGB;
+let lo = 0.1, hi = 0.8;
+let seg = null, maskData = null, maskImg = null, lastVT = -1;
+let calibN = 0, calibAcc = 0, wantCapture = false;
+
+// 필드(셀) 분석 상태
+let on, prevOn, edge, motL, cellG, sat, label, stack;
+let hasSubject = false, framesWithSubject = 0, motionS = 0;
+let subjCx = 0, subjCy = 0, bbx = 0, bby = 0, sdx = 0, sdy = 0, velX = 0, velY = 0;
+let accX = 0, accY = 0, shiftX = 0, shiftY = 0, lastSampleT = -1, lastFrame = 0, stepAcc = 0;
+
+// 픽셀 파티클 풀 — OWNED: 셀 하나를 목표로 스프링으로 뒤늦게 따라감 / FLOATING: 떨어져 나가 떠다니다 사라짐
+const DEAD = 0, OWNED = 1, FLOATING = 2, TAU = Math.PI * 2, STEP_MS = 1000 / 60;
+let cap = 0, qx, qy, qvx, qvy, qg, qfade, qlife, qlifeMax, qjx, qjy, qsize, qk, qf, qcell, qstate;
+let freeStack, freeTop = 0, owner, nextOwner, head, link;
+
+const GRAY = Array.from({ length: 256 }, (_, g) => `rgb(${g},${g},${g})`);
+const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+const mix = (a, b, t) => a + (b - a) * t;
+function hash(n) {
+  n = Math.imul(n ^ (n >>> 16), 0x7feb352d);
+  n = Math.imul(n ^ (n >>> 15), 0x846ca68b);
+  return ((n ^ (n >>> 16)) >>> 0) / 4294967296;
+}
+const h2 = (x, y) => hash(Math.imul(x, 0x1f1f1f1f) ^ Math.imul(y, 0x5bd1e995) ^ 0x2c1b3c6d);
+function noise2(x, y) {
+  const ix = Math.floor(x), iy = Math.floor(y), fx = x - ix, fy = y - iy;
+  const ux = fx * fx * (3 - 2 * fx), uy = fy * fy * (3 - 2 * fy);
+  return mix(mix(h2(ix, iy), h2(ix + 1, iy), ux), mix(h2(ix, iy + 1), h2(ix + 1, iy + 1), ux), uy);
+}
+
+function build() {
+  dpr = Math.min(devicePixelRatio || 1, 2);
+  W = cv.width = Math.round(innerWidth * dpr);
+  H = cv.height = Math.round(innerHeight * dpr);
+  cs = Math.max(3, Math.round(cfg.cell * dpr));
+  ms = Math.round(cfg.moveCell * dpr);   // 움직일 때 기준 크기
+  cols = Math.ceil(W / cs); rows = Math.ceil(H / cs); N = cols * rows;
+  ox = Math.floor((W - cols * cs) / 2); oy = Math.floor((H - rows * cs) / 2);
+  sc.width = mg.width = cols; sc.height = mg.height = rows;
+  const F = () => new Float32Array(N);
+  lum = F(); prev = F(); raw = F(); msk = F(); rim = F(); tmp = F(); glife = F();
+  edge = F(); motL = F(); cellG = F();
+  cur = new Uint8Array(N * 3); bgRGB = null; tone = new Uint8Array(N);
+  on = new Uint8Array(N); prevOn = new Uint8Array(N);
+  label = new Int32Array(N); stack = new Int32Array(N); sat = new Int32Array((cols + 1) * (rows + 1));
+  owner = new Int32Array(N).fill(-1); nextOwner = new Int32Array(N); head = new Int32Array(N);
+
+  cap = Math.ceil(N * 1.6) + 4000;
+  const P = () => new Float32Array(cap);
+  qx = P(); qy = P(); qvx = P(); qvy = P(); qg = P(); qfade = P(); qlife = P(); qlifeMax = P();
+  qjx = P(); qjy = P(); qsize = P(); qk = P(); qf = P();
+  qcell = new Int32Array(cap); qstate = new Uint8Array(cap); link = new Int32Array(cap);
+  freeStack = new Int32Array(cap);
+  for (let q = 0; q < cap; q++) freeStack[q] = cap - 1 - q;
+  freeTop = cap;
+
+  hasSubject = false; framesWithSubject = 0; velX = velY = accX = accY = 0;
+  if (cfg.mode === 'bg') wantCapture = true;
+}
+
+// 영상/마스크를 그리드 크기로 cover + 좌우반전
+function drawCover(c, src, sw, sh) {
+  const s = Math.max(cols / sw, rows / sh), dw = sw * s, dh = sh * s;
+  c.setTransform(-1, 0, 0, 1, cols, 0);
+  c.imageSmoothingEnabled = true; c.imageSmoothingQuality = 'high';
+  c.drawImage(src, (cols - dw) / 2, (rows - dh) / 2, dw, dh);
+  c.setTransform(1, 0, 0, 1, 0, 0);
+}
+
+function runSeg(now) {
+  if (video.currentTime !== lastVT) {
+    lastVT = video.currentTime;
+    seg.segmentForVideo(video, now, res => {
+      const m = res.confidenceMasks && res.confidenceMasks[0];
+      if (!m) return;
+      const w = m.width, h = m.height, f = m.getAsFloat32Array();
+      if (mc.width !== w || mc.height !== h || !maskImg) { mc.width = w; mc.height = h; maskImg = mx.createImageData(w, h); }
+      const d = maskImg.data;
+      for (let j = 0, k = 0; j < f.length; j++, k += 4) { const v = f[j] * 255; d[k] = v; d[k + 3] = 255; }
+      mx.putImageData(maskImg, 0, 0);
+    });
+    drawCover(gx, mc, mc.width, mc.height);
+    maskData = gx.getImageData(0, 0, cols, rows).data;
+  }
+  if (!maskData || maskData.length !== N * 4) return;
+  for (let i = 0; i < N; i++) raw[i] = maskData[i * 4] / 255;
+
+  // 마스크 극성 자동 판별: 화면 테두리는 보통 배경
+  if (cfg.invert === null) {
+    let b = 0, n = 0;
+    for (let x = 0; x < cols; x++) { b += raw[x] + raw[N - 1 - x]; n += 2; }
+    for (let y = 0; y < rows; y++) { b += raw[y * cols] + raw[y * cols + cols - 1]; n += 2; }
+    calibAcc += b / n; calibN++;
+    if (calibN >= 30) cfg.invert = calibAcc / calibN > 0.5;
+    if (calibAcc / calibN > 0.5) for (let i = 0; i < N; i++) raw[i] = 1 - raw[i];
+  } else if (cfg.invert) for (let i = 0; i < N; i++) raw[i] = 1 - raw[i];
+}
+
+const smooth = (a, b, x) => { const t = Math.min(1, Math.max(0, (x - a) / (b - a))); return t * t * (3 - 2 * t); };
+
+function sample(now) {
+  drawCover(sx, video, video.videoWidth, video.videoHeight);
+  const d = sx.getImageData(0, 0, cols, rows).data;
+  for (let i = 0, k = 0; i < N; i++, k += 4) {
+    cur[i * 3] = d[k]; cur[i * 3 + 1] = d[k + 1]; cur[i * 3 + 2] = d[k + 2];
+    lum[i] = (0.299 * d[k] + 0.587 * d[k + 1] + 0.114 * d[k + 2]) / 255;
+  }
+  if (wantCapture) { bgRGB = cur.slice(); wantCapture = false; }
+
+  if (cfg.mode === 'ai' && seg) runSeg(now);
+  else if (cfg.mode === 'bg' && bgRGB) {
+    for (let i = 0, k = 0; i < N; i++, k += 3) {
+      const df = (Math.abs(cur[k] - bgRGB[k]) + Math.abs(cur[k + 1] - bgRGB[k + 1]) + Math.abs(cur[k + 2] - bgRGB[k + 2])) / 765;
+      raw[i] = smooth(0.05, 0.13, df);
+    }
+  } else raw.fill(cfg.mode === 'bg' ? 1 : 0);
+
+  // 3x3 블러 후 경계 정리
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    let s = 0, n = 0;
+    for (let j = -1; j <= 1; j++) { const yy = y + j; if (yy < 0 || yy >= rows) continue;
+      for (let i = -1; i <= 1; i++) { const xx = x + i; if (xx < 0 || xx >= cols) continue; s += raw[yy * cols + xx]; n++; } }
+    msk[y * cols + x] = smooth(0.35, 0.65, s / n);
+  }
+
+  // 외곽 띠: 넓게(반경 3칸) 흐린 마스크가 0.5 근처인 곳 = 피사체 테두리 (가만히 있을 때 꿈틀대는 범위)
+  const R_ = 3;
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    let s = 0, n = 0;
+    for (let i = -R_; i <= R_; i++) { const xx = x + i; if (xx >= 0 && xx < cols) { s += msk[y * cols + xx]; n++; } }
+    tmp[y * cols + x] = s / n;
+  }
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    let s = 0, n = 0;
+    for (let j = -R_; j <= R_; j++) { const yy = y + j; if (yy >= 0 && yy < rows) { s += tmp[yy * cols + x]; n++; } }
+    const v = 1 - Math.abs(s / n * 2 - 1);
+    rim[y * cols + x] = v * v;
+  }
+
+  // 피사체 영역 기준 자동 대비
+  let mn = 1, mxv = 0, cnt = 0;
+  for (let i = 0; i < N; i++) if (msk[i] > 0.5) { const l = lum[i]; if (l < mn) mn = l; if (l > mxv) mxv = l; cnt++; }
+  if (cnt > 20) { lo += (mn - lo) * 0.05; hi += (Math.max(mxv, mn + 0.2) - hi) * 0.05; }
+}
+
+// ── 셀 분석: 인물 셀, 외곽 강도, 국소 움직임, 피사체 이동량, 회색 단계
+function analyze(dtMs) {
+  for (let i = 0; i < N; i++) { const s = msk[i]; on[i] = prevOn[i] ? (s > 0.4 ? 1 : 0) : (s > 0.56 ? 1 : 0); }
+  dropSpecks(); computeEdges();
+
+  for (let i = 0; i < N; i++) {
+    const ldRaw = Math.abs(lum[i] - prev[i]);
+    const md = on[i] !== prevOn[i] ? 1 : 0;
+    const ld = on[i] ? clamp((ldRaw - 0.07) * 5, 0, 1) : 0;
+    tmp[i] = md > ld ? md : ld;
+    if (on[i] && ldRaw > 0.07) glife[i] = 1;   // 움직인 셀은 크게
+  }
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    let s = 0, c = 0;
+    for (let j = -1; j <= 1; j++) { const yy = y + j; if (yy < 0 || yy >= rows) continue;
+      for (let k = -1; k <= 1; k++) { const xx = x + k; if (xx < 0 || xx >= cols) continue; s += tmp[yy * cols + xx]; c++; } }
+    const i = y * cols + x, b = (s / c) * 1.6;
+    motL[i] = Math.max(motL[i] * 0.55, b > 1 ? 1 : b);
+  }
+
+  // 피사체 이동: 몸 중심부 중심점 + 바운딩 박스 중심
+  let cnt = 0, core = 0, sxx = 0, syy = 0, minX = cols, minY = rows, maxX = -1, maxY = -1;
+  for (let y = 0; y < rows; y++) for (let x = 0; x < cols; x++) {
+    const i = y * cols + x;
+    if (!on[i]) continue;
+    cnt++;
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (y < minY) minY = y; if (y > maxY) maxY = y;
+    if (edge[i] < 0.05) { sxx += x; syy += y; core++; }
+  }
+  if (core < 12) { sxx = syy = core = 0; for (let i = 0; i < N; i++) if (on[i]) { sxx += i % cols; syy += (i / cols) | 0; core++; } }
+  const had = hasSubject;
+  hasSubject = cnt > 24;
+  sdx = sdy = 0;
+  if (hasSubject) {
+    const ccx = ox + (sxx / core + 0.5) * cs, ccy = oy + (syy / core + 0.5) * cs;
+    const nbx = ox + ((minX + maxX) / 2 + 0.5) * cs, nby = oy + ((minY + maxY) / 2 + 0.5) * cs;
+    if (had) {
+      let dx = (ccx - subjCx) * 0.75 + (nbx - bbx) * 0.25, dy = (ccy - subjCy) * 0.75 + (nby - bby) * 0.25;
+      const d = Math.hypot(dx, dy);
+      if (d < cs * 0.3) dx = dy = 0;
+      const lim = Math.min(W, H) * 0.2;
+      if (d > lim) { dx *= lim / d; dy *= lim / d; }
+      sdx = dx; sdy = dy;
+    }
+    subjCx = ccx; subjCy = ccy; bbx = nbx; bby = nby;
+  }
+  const k = 0.45, inv = dtMs > 0 ? 1000 / dtMs : 0;
+  velX = velX * (1 - k) + sdx * inv * k;
+  velY = velY * (1 - k) + sdy * inv * k;
+  if (sdx || sdy) { accX += sdx / cs; accY += sdy / cs; } else { accX *= 0.6; accY *= 0.6; }
+  shiftX = Math.trunc(accX); shiftY = Math.trunc(accY); accX -= shiftX; accY -= shiftY;
+
+  // 회색 단계 (경계에서 깜빡이지 않도록 히스테리시스)
+  const rng = hi - lo || 1;
+  for (let i = 0; i < N; i++) {
+    if (!on[i]) continue;
+    const f = clamp((lum[i] - lo) / rng, 0, 1) * (TONES - 1), t = tone[i];
+    if (f > t + 0.65 || f < t - 0.65) tone[i] = Math.round(f);
+    cellG[i] = tone[i] / (TONES - 1);
+  }
+  prev.set(lum); prevOn.set(on);
+}
+
+function dropSpecks() {
+  label.fill(-1);
+  const sizes = [];
+  for (let s = 0; s < N; s++) {
+    if (!on[s] || label[s] >= 0) continue;
+    const id = sizes.length;
+    let top = 0, size = 0;
+    stack[top++] = s; label[s] = id;
+    while (top) {
+      const i = stack[--top]; size++;
+      const x = i % cols, y = (i / cols) | 0;
+      if (x > 0 && on[i - 1] && label[i - 1] < 0) { label[i - 1] = id; stack[top++] = i - 1; }
+      if (x < cols - 1 && on[i + 1] && label[i + 1] < 0) { label[i + 1] = id; stack[top++] = i + 1; }
+      if (y > 0 && on[i - cols] && label[i - cols] < 0) { label[i - cols] = id; stack[top++] = i - cols; }
+      if (y < rows - 1 && on[i + cols] && label[i + cols] < 0) { label[i + cols] = id; stack[top++] = i + cols; }
+    }
+    sizes.push(size);
+  }
+  if (!sizes.length) return;
+  const minSize = Math.max(6, Math.max(...sizes) * 0.03);
+  for (let i = 0; i < N; i++) if (on[i] && sizes[label[i]] < minSize) on[i] = 0;
+}
+
+function computeEdges() {
+  const W1 = cols + 1;
+  for (let x = 0; x <= cols; x++) sat[x] = 0;
+  for (let y = 1; y <= rows; y++) {
+    let row = 0; sat[y * W1] = 0;
+    for (let x = 1; x <= cols; x++) { row += on[(y - 1) * cols + x - 1]; sat[y * W1 + x] = sat[(y - 1) * W1 + x] + row; }
+  }
+  const r = 2;
+  for (let y = 0; y < rows; y++) {
+    const y0 = Math.max(0, y - r), y1 = Math.min(rows, y + r + 1);
+    for (let x = 0; x < cols; x++) {
+      const i = y * cols + x;
+      if (!on[i]) { edge[i] = 0; continue; }
+      const x0 = Math.max(0, x - r), x1 = Math.min(cols, x + r + 1);
+      const c = sat[y1 * W1 + x1] - sat[y0 * W1 + x1] - sat[y1 * W1 + x0] + sat[y0 * W1 + x0];
+      edge[i] = clamp((1 - c / ((x1 - x0) * (y1 - y0))) * 2.4, 0, 1);
+    }
+  }
+}
+
+// ── 파티클
+function alloc() {
+  if (!freeTop) return -1;
+  const q = freeStack[--freeTop], r = Math.random;
+  qvx[q] = qvy[q] = 0; qfade[q] = 0;
+  qjx[q] = qjy[q] = 0; qsize[q] = 1;   // 표시는 이전처럼 고른 격자 블록
+  qk[q] = 0.6 + r() * 0.8;
+  qf[q] = (r() - 0.5) * 0.08;
+  return q;
+}
+function kill(q) { qstate[q] = DEAD; qcell[q] = -1; freeStack[freeTop++] = q; }
+function release(q) {
+  qstate[q] = FLOATING; qcell[q] = -1;
+  qvx[q] *= 0.6; qvy[q] *= 0.6;
+  qlife[q] = qlifeMax[q] = Math.max(80, TRAIL_MS * (0.5 + Math.random()));
+}
+function claimNear(c, R) {
+  const cx = c % cols, cy = (c / cols) | 0;
+  for (let r = 0; r <= R; r++) for (let y = cy - r; y <= cy + r; y++) {
+    if (y < 0 || y >= rows) continue;
+    const ring = y === cy - r || y === cy + r;
+    for (let x = cx - r; x <= cx + r; x += ring || r === 0 ? 1 : 2 * r) {
+      if (x < 0 || x >= cols) continue;
+      for (let q = head[y * cols + x]; q >= 0; q = link[q]) if (qstate[q] === FLOATING) return q;
+    }
+  }
+  return -1;
+}
+
+// 분석 프레임마다: 목표 셀 재배정, 새 픽셀 생성, 산란 임펄스, 잔상 방출
+function assign(t) {
+  const next = nextOwner; next.fill(-1);
+  framesWithSubject = hasSubject ? framesWithSubject + 1 : 0;
+  const fresh = framesWithSubject < 8;
+
+  // 1) 피사체 이동량만큼 목표를 옮김 — 픽셀은 스프링으로 뒤늦게 따라와 지연이 생김
+  for (let c = 0; c < N; c++) {
+    const q = owner[c];
+    if (q < 0) continue;
+    let c2 = c;
+    if (shiftX || shiftY) {
+      const x = (c % cols) + shiftX, y = ((c / cols) | 0) + shiftY;
+      c2 = x >= 0 && x < cols && y >= 0 && y < rows ? y * cols + x : -1;
+    }
+    if (c2 >= 0 && on[c2] && next[c2] < 0) { next[c2] = q; qcell[q] = c2; }
+    else release(q);   // 마스크에서 사라짐 → 떠다니다 사라짐
+  }
+
+  // 2) 방금 풀려난 픽셀은 근처에 새로 생긴 셀이 재사용 (부위가 움직이면 픽셀이 끌려감)
+  head.fill(-1);
+  for (let q = 0; q < cap; q++) {
+    if (qstate[q] !== FLOATING || qlife[q] < qlifeMax[q] * 0.45) continue;
+    const gx_ = Math.floor((qx[q] - ox) / cs), gy_ = Math.floor((qy[q] - oy) / cs);
+    if (gx_ < 0 || gx_ >= cols || gy_ < 0 || gy_ >= rows) continue;
+    const g = gy_ * cols + gx_;
+    link[q] = head[g]; head[g] = q;
+  }
+  const dl = Math.hypot(sdx, sdy) || 1;
+  for (let c = 0; c < N; c++) {
+    if (!on[c] || next[c] >= 0) continue;
+    const q = claimNear(c, 3);
+    if (q >= 0) { qstate[q] = OWNED; qcell[q] = c; next[c] = q; qfade[q] = Math.max(0.3, qlife[q] / qlifeMax[q]); continue; }
+    const s = alloc();
+    if (s < 0) continue;
+    qstate[s] = OWNED; qcell[s] = c; next[c] = s; qg[s] = cellG[c];
+    // 불규칙한 위치에서 태어나 모임. 움직이는 중이면 지나온 쪽에서 나타남
+    const tx = ox + ((c % cols) + 0.5) * cs, ty = oy + (((c / cols) | 0) + 0.5) * cs;
+    const a = Math.random() * TAU, rr = Math.random();
+    const r = cs * (fresh ? 1.5 + rr * rr * 16 : 0.6 + rr * rr * 3.5);
+    const back = fresh ? 0 : Math.random() * 2.5;
+    qx[s] = tx + Math.cos(a) * r - (sdx / dl) * back * Math.min(dl, cs * 3);
+    qy[s] = ty + Math.sin(a) * r - (sdy / dl) * back * Math.min(dl, cs * 3);
+  }
+  nextOwner = owner; owner = next;
+
+  // 3) 산란: 이동 반대 방향 + 몸 중심에서 바깥쪽 + 고정 노이즈 장
+  const motion = clamp(Math.hypot(velX, velY) / (MOTION_TH * dpr), 0, 1);
+  const maxV = cs * 2, scatter = cfg.scatter;
+  let emitted = 0;
+  const emitCap = Math.max(40, N * 0.02);
+  for (let c = 0; c < N; c++) {
+    const q = owner[c];
+    if (q < 0) continue;
+    qg[q] += (cellG[c] - qg[q]) * 0.6;
+    const e = edge[c];
+    let s = (motion * mix(0.25, 1, e) + motL[c] * mix(0.1, 0.7, e)) * scatter;
+    if (s < 0.03) continue;
+    if (s > 1.4) s = 1.4;
+    const cx = c % cols, cy = (c / cols) | 0;
+    let rx = ox + (cx + 0.5) * cs - subjCx, ry = oy + (cy + 0.5) * cs - subjCy;
+    const rl = Math.hypot(rx, ry) || 1; rx /= rl; ry /= rl;
+    const ang = noise2(cx * 0.11 + t * 0.00031, cy * 0.11 - t * 0.00023) * TAU * 2;
+    // 중심부는 거의 유지, 외곽일수록 크게 흩어짐
+    const tr = 0.12 * s * mix(0.3, 1, e), nz = cs * mix(0.05, 0.26, e) * s;
+    let nvx = qvx[q] - sdx * tr + (Math.cos(ang) + rx * 0.6 * e) * nz;
+    let nvy = qvy[q] - sdy * tr + (Math.sin(ang) + ry * 0.6 * e) * nz;
+    const v = Math.hypot(nvx, nvy);
+    if (v > maxV) { nvx *= maxV / v; nvy *= maxV / v; }
+    qvx[q] = nvx; qvy[q] = nvy;
+
+    // 잔상: 외곽 픽셀의 복제본이 이동 반대편으로 남음
+    if (emitted < emitCap && motion > 0.1 && e > 0.3 && Math.random() < motion * e * 0.05 * scatter) {
+      const g = alloc();
+      if (g >= 0) {
+        emitted++;
+        qstate[g] = FLOATING; qcell[g] = -1;
+        qx[g] = qx[q]; qy[g] = qy[q];
+        const kk = 0.08 + Math.random() * 0.2;
+        qvx[g] = -velX / 60 * kk + Math.cos(ang) * cs * 0.06;
+        qvy[g] = -velY / 60 * kk + Math.sin(ang) * cs * 0.06;
+        qg[g] = qg[q]; qfade[g] = 1;
+        qlife[g] = qlifeMax[g] = TRAIL_MS * (0.5 + Math.random());
+      }
+    }
+  }
+}
+
+// 60Hz 고정 스텝 물리
+function step() {
+  const far = cs * 8, reach = ms * MAX_REACH;
+  for (let q = 0; q < cap; q++) {
+    const st = qstate[q];
+    if (st === OWNED) {
+      const c = qcell[q];
+      const tx = ox + ((c % cols) + 0.5) * cs + qjx[q], ty = oy + (((c / cols) | 0) + 0.5) * cs + qjy[q];
+      // 움직임이 클수록, 외곽일수록 스프링이 약해져 더 늦게 따라옴
+      let k = SPRING * qk[q] * (1 - 0.62 * motionS * mix(0.35, 1, edge[c]));
+      let ddx = tx - qx[q], ddy = ty - qy[q];
+      if (Math.abs(ddx) + Math.abs(ddy) > far) k *= 1.8;
+      const f = clamp(FRICTION + qf[q], 0.4, 0.975);
+      // 외곽은 가만히 있어도 자잘하게 꿈틀
+      const jit = rim[c] * IDLE_JITTER * cs;
+      if (jit > 0.01 && Math.random() < 0.5) { qvx[q] += (Math.random() - 0.5) * jit * 2; qvy[q] += (Math.random() - 0.5) * jit * 2; }
+      qvx[q] = (qvx[q] + ddx * k) * f; qvy[q] = (qvy[q] + ddy * k) * f;
+      qx[q] += qvx[q]; qy[q] += qvy[q];
+      // 너무 멀리 가지 않도록 목표 자리 기준 반경 안에 묶어 둠
+      ddx = qx[q] - tx; ddy = qy[q] - ty;
+      const dd = Math.hypot(ddx, ddy);
+      if (dd > reach) { const kk = reach / dd; qx[q] = tx + ddx * kk; qy[q] = ty + ddy * kk; qvx[q] *= 0.5; qvy[q] *= 0.5; }
+      const fd = qfade[q] + 0.35; qfade[q] = fd > 1 ? 1 : fd;
+    } else if (st === FLOATING) {
+      qvx[q] *= 0.92; qvy[q] *= 0.92;
+      qx[q] += qvx[q]; qy[q] += qvy[q];
+      qlife[q] -= STEP_MS;
+      if (qlife[q] <= 0) kill(q);
+    }
+  }
+  for (let i = 0; i < N; i++) glife[i] *= 0.72;
+}
+
+function render() {
+  ctx.globalAlpha = 1; ctx.fillStyle = '#000'; ctx.fillRect(0, 0, W, H);
+  const big = ms * (1 + MOVE_GROW) - cs;
+  // pass 0: 정지·떠다니는 픽셀, pass 1: 움직임이 감지된 셀(크게, 위에 덮어 그림)
+  for (let pass = 0; pass < 2; pass++) {
+    for (let q = 0; q < cap; q++) {
+      const st = qstate[q];
+      if (st === DEAD) continue;
+      let size, a, moving = false;
+      if (st === OWNED) {
+        const c = qcell[q];
+        moving = glife[c] > 0.15;
+        if (moving !== (pass === 1)) continue;
+        size = moving ? cs + big * glife[c]
+          : rim[c] > 0.2 ? cs * (1 + (Math.random() - 0.5) * 0.7 * rim[c]) : cs;
+        a = qfade[q];
+        qg[q] = cellG[c];
+      } else {
+        if (pass === 1) continue;
+        const lf = qlife[q] / qlifeMax[q];
+        a = lf * lf * qfade[q] * 0.9;
+        size = cs * qsize[q] * (0.55 + 0.45 * lf);
+      }
+      if (a < 0.02) continue;
+      const s = Math.max(1, Math.round(size));
+      ctx.globalAlpha = a; ctx.fillStyle = GRAY[toneGray(qg[q])];
+      ctx.fillRect(Math.round(qx[q] - s / 2), Math.round(qy[q] - s / 2), s, s);
+    }
+  }
+}
+
+function loop(now) {
+  requestAnimationFrame(loop);
+  const dt = lastFrame ? now - lastFrame : STEP_MS;
+  lastFrame = now;
+  if (video.readyState >= 2 && video.videoWidth && video.currentTime !== lastSampleT) {
+    const adt = lastSampleT < 0 ? STEP_MS : (video.currentTime - lastSampleT) * 1000;
+    lastSampleT = video.currentTime;
+    sample(now); analyze(adt); assign(now);
+  }
+  const m = clamp(Math.hypot(velX, velY) / (MOTION_TH * dpr), 0, 1);
+  stepAcc = Math.min(stepAcc + dt, STEP_MS * 4);
+  while (stepAcc >= STEP_MS) {
+    motionS += (m - motionS) * (m > motionS ? 0.25 : 0.035);
+    step();
+    stepAcc -= STEP_MS;
+  }
+  render();
+}
+
+function drawHud() {
+  const mode = cfg.mode === 'ai' ? (seg ? '인물 인식' : '인물 인식 (모델 로딩 중)') : (bgRGB ? '배경 차이' : '배경 차이 — B로 빈 배경 저장');
+  hud.innerHTML =
+`<b>${mode}</b>  ·  셀 ${cfg.cell}px  ·  흩어짐 ${cfg.scatter.toFixed(1)}
+M  모드 전환 (인물 인식 ↔ 배경 차이: 물건도 잡힘)
+B  지금 화면을 빈 배경으로 저장 (화면 밖으로 나간 뒤)
+[ ]  픽셀 크기     - +  흩어짐 강도
+I  마스크 반전     H  이 안내 숨기기`;
+}
+
+addEventListener('keydown', e => {
+  const k = e.key.toLowerCase();
+  if (k === 'h') cfg.hud = !cfg.hud;
+  else if (k === 'm') { cfg.mode = cfg.mode === 'ai' ? 'bg' : 'ai'; if (cfg.mode === 'bg' && !bgRGB) cfg.hud = true; }
+  else if (k === 'b') { cfg.mode = 'bg'; wantCapture = true; }
+  else if (k === '[') { cfg.cell = Math.max(4, cfg.cell - 1); build(); }
+  else if (k === ']') { cfg.cell = Math.min(48, cfg.cell + 1); build(); }
+  else if (k === '-') cfg.scatter = Math.max(0, cfg.scatter - 0.2);
+  else if (k === '=' || k === '+') cfg.scatter = Math.min(5, cfg.scatter + 0.2);
+  else if (k === 'i') cfg.invert = !cfg.invert;
+  else return;
+  drawHud(); hud.classList.toggle('on', cfg.hud);
+});
+addEventListener('resize', build);
+
+async function loadSeg() {
+  const files = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm');
+  const opts = d => ({
+    baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/image_segmenter/selfie_segmenter/float16/latest/selfie_segmenter.tflite', delegate: d },
+    runningMode: 'VIDEO', outputCategoryMask: false, outputConfidenceMasks: true,
+  });
+  try { return await ImageSegmenter.createFromOptions(files, opts('GPU')); }
+  catch { return await ImageSegmenter.createFromOptions(files, opts('CPU')); }
+}
+
+startEl.addEventListener('click', async () => {
+  startEl.textContent = 'starting camera…';
+  try {
+    video.srcObject = await navigator.mediaDevices.getUserMedia({ video: { width: { ideal: 960 }, height: { ideal: 540 }, facingMode: 'user' }, audio: false });
+    await video.play();
+  } catch (err) { startEl.textContent = 'camera blocked — allow access and click again'; return; }
+  startEl.classList.add('hide');
+  build(); drawHud(); requestAnimationFrame(loop);
+  loadSeg().then(s => { seg = s; drawHud(); })
+    .catch(() => { cfg.mode = 'bg'; cfg.hud = true; drawHud(); hud.classList.add('on'); });
+}, { once: false });
+</script>
+</body>
+</html>
